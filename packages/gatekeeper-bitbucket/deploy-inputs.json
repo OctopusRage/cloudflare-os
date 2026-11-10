@@ -1,0 +1,20 @@
+[
+  {
+    "name": "CLIENT_ID",
+    "kind": "secret",
+    "label": "OAuth consumer key",
+    "consoleUrl": "https://bitbucket.org/account/settings/",
+    "setupSteps": [
+      "In Bitbucket, open a workspace you administer → Settings → OAuth consumers → Add consumer.",
+      "Set the Callback URL to the value below and check \"This is a private consumer\".",
+      "Grant the permissions: Account Read, Repositories Write, Pull requests Write.",
+      "Save, then copy the consumer Key here and its Secret below."
+    ],
+    "redirectUriTemplate": "{PUBLIC_BASE_URL}/gatekeeper/bitbucket/oauth"
+  },
+  {
+    "name": "CLIENT_SECRET",
+    "kind": "secret",
+    "label": "OAuth consumer secret"
+  }
+]
