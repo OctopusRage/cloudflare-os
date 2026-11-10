@@ -73,8 +73,11 @@ export interface BitbucketRepository {
    * branch restrictions are checked by Bitbucket when the push is made: a push they reject is
    * not made, and Bitbucket's reason is reported.
    *
+   * The push is made only once the user approves it, and your turn pauses until they decide.
+   * Afterwards the branch reads as pushed (or unchanged, if they rejected it).
+   *
    * To open a pull request for newly pushed work: `push(branch, commitId)` to a new branch,
-   * then `createPullRequest({sourceBranch: branch, ...})` -- immediately is fine.
+   * then `createPullRequest({sourceBranch: branch, ...})`.
    */
   push(branch: string, commitId: string, options?: { force?: boolean }): Promise<void>;
 
@@ -82,11 +85,11 @@ export interface BitbucketRepository {
    * Opens a pull request from `options.sourceBranch` into `options.destinationBranch` (the main
    * branch when omitted), both in this repository.
    *
-   * The pull request may not be created on Bitbucket immediately. While creation is pending,
-   * the returned pull request has a provisional id (e.g. `"~1"`) instead of a real number; the
-   * returned object is fully functional in the meantime.
+   * The pull request is opened only once the user approves it, and your turn pauses until they
+   * decide. To work with it afterwards, find it with
+   * `listPullRequests({ sourceBranch })` and open it with `getPullRequest(id)`.
    */
-  createPullRequest(options: BitbucketCreatePullRequestOptions): Promise<BitbucketPullRequest>;
+  createPullRequest(options: BitbucketCreatePullRequestOptions): Promise<void>;
 
   /** Opens a pull request of this repository by its number (e.g. `"42"`). */
   getPullRequest(id: string): Promise<BitbucketPullRequest>;
@@ -108,6 +111,10 @@ export interface BitbucketRepository {
  * `getDetails()` for the source and destination commit ids.
  */
 export interface BitbucketPullRequest {
+  // Every change below (comments, edits, reviews, decline, merge) is made only once the user
+  // approves it, and your turn pauses until they decide. Approving, declining and merging always
+  // need the user's review; the others can be auto-approved if the user allows it.
+
   /** Returns the pull request's title, description, state, branches, and reviewers. */
   getDetails(): Promise<BitbucketPullRequestDetails>;
 

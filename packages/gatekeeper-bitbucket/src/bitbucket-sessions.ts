@@ -3,14 +3,16 @@
 // listings authorize each page. Commit ids a read returns are advertised to the workspace git
 // cache, so the overseer knows this gatekeeper can pull them (see `Gatekeeper.gitPull`).
 //
-// Phase 1 is read-only: every write method refuses until actions land (push, pull request
-// creation, comments, review and merge are all staged for approval then).
+// Every write is checked here, then submitted for the user's approval and made only once
+// approved (see bitbucket-actions.ts). None is simulated: the agent waits for the decision.
 
 import { RpcTarget, type RpcStub } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
-import type { ApprovalQueue } from "@gadgets/workshop-shared/gatekeeper";
+import type { ApprovalQueue, GitCache } from "@gadgets/workshop-shared/gatekeeper";
 import { TokenCursor, SessionGitCache } from "@gadgets/gatekeeper-kit/cursors";
-import { commitIdsOfSummary } from "@gadgets/gatekeeper-kit/git-objects";
+import { commitIdsOfSummary, isCommitOid } from "@gadgets/gatekeeper-kit/git-objects";
+import { validateBranchName } from "@gadgets/gatekeeper-kit/git-transport";
+import { MAX_BODY_LENGTH, type BitbucketActions, type PushPayload } from "./bitbucket-actions";
 import type { ObservationInput } from "@gadgets/gatekeeper-kit/observers";
 import { BitbucketApi, seg, type Page } from "./bitbucket-api";
 import {
@@ -33,7 +35,9 @@ const REMOTE_PAGE_SIZE = 50;
 /** How long a listing page or commit read is reused within a connection. */
 const LIST_CACHE_TTL_MS = 30_000;
 const PR_STATES: readonly BitbucketPullRequestState[] = ["OPEN", "MERGED", "DECLINED", "SUPERSEDED"];
-const READ_ONLY = "Writes to Bitbucket are not supported by this gatekeeper yet; it is read-only for now.";
+const MAX_TITLE_LENGTH = 255;
+const MERGE_STRATEGIES = ["merge_commit", "squash", "fast_forward"] as const;
+const ACCOUNT_ID = /^[A-Za-z0-9:_-]{1,128}$/;
 
 /** What the gatekeeper Durable Object lends its sessions. */
 export type SessionHost = {
@@ -43,7 +47,20 @@ export type SessionHost = {
   read<T>(op: (api: BitbucketApi, base: string) => Promise<T>): Promise<T>;
   /** A read cache partitioned by connection. */
   cached<T>(key: string, ttlMs: number, load: () => Promise<T>): Promise<T>;
+  /** Submits an action for approval, fenced on the binding's pinned user. */
+  submit<K extends keyof BitbucketActions>(queue: RpcStub<ApprovalQueue>, kind: K, payload: BitbucketActions[K]):
+    Promise<number>;
+  /** Checks a push and picks its definition; null when the branch is already at the commit. */
+  preparePush(branch: string, commitId: string, force: boolean, gitCache: RpcStub<GitCache>):
+    Promise<{ kind: keyof BitbucketActions; payload: PushPayload } | null>;
 };
+
+/** A non-empty text argument within `max` characters. */
+function text(value: unknown, what: string, max: number): string {
+  if (typeof value !== "string" || value.trim() === "") throw new Error(`${what} must be a non-empty string.`);
+  if (value.length > max) throw new Error(`${what} is longer than ${max} characters.`);
+  return value;
+}
 
 /** One session's borrowed approval queue, git cache and host. */
 export class SessionContext implements Disposable {
@@ -219,12 +236,36 @@ export class BitbucketRepositoryImpl extends RpcTarget implements BitbucketRepos
     });
   }
 
-  async push(_branch: string, _commitId: string, _options?: { force?: boolean }): Promise<void> {
-    throw new Error(READ_ONLY);
+  async push(branch: string, commitId: string, options?: { force?: boolean }): Promise<void> {
+    validateBranchName(branch);
+    if (!isCommitOid(commitId)) {
+      throw new Error(`push() requires a full 40-character commit id; got ${JSON.stringify(commitId)}. ` +
+        "Use resolveRef() to resolve a truncated id.");
+    }
+    const prepared = await this.ctx.host.preparePush(branch, commitId, options?.force === true, await this.ctx.git.stub());
+    if (prepared === null) return;  // the branch is already at commitId
+    await this.ctx.host.submit(this.ctx.queue, prepared.kind, prepared.payload);
   }
 
-  async createPullRequest(_options: BitbucketCreatePullRequestOptions): Promise<BitbucketPullRequest> {
-    throw new Error(READ_ONLY);
+  async createPullRequest(options: BitbucketCreatePullRequestOptions): Promise<void> {
+    const title = text(options?.title, "title", MAX_TITLE_LENGTH);
+    const sourceBranch = validateBranchName(options.sourceBranch);
+    const destinationBranch = options.destinationBranch === undefined ? undefined
+      : validateBranchName(options.destinationBranch);
+    if (destinationBranch === sourceBranch) throw new Error("The source and destination branches are the same.");
+    const description = options.descriptionMarkdown === undefined ? undefined
+      : text(options.descriptionMarkdown, "descriptionMarkdown", MAX_BODY_LENGTH);
+    const reviewers = options.reviewerAccountIds ?? [];
+    if (!Array.isArray(reviewers) || reviewers.length > 20 || reviewers.some(id => typeof id !== "string" || !ACCOUNT_ID.test(id))) {
+      throw new Error("reviewerAccountIds must be up to 20 Bitbucket account ids.");
+    }
+    await this.ctx.host.submit(this.ctx.queue, "createPullRequest", {
+      title, sourceBranch,
+      ...(destinationBranch !== undefined ? { destinationBranch } : {}),
+      ...(description !== undefined ? { description } : {}),
+      closeSourceBranch: options.closeSourceBranch === true,
+      reviewerAccountIds: [...reviewers],
+    });
   }
 
   async getPullRequest(id: string): Promise<BitbucketPullRequest> {
@@ -322,41 +363,68 @@ export class BitbucketPullRequestImpl extends RpcTarget implements BitbucketPull
     });
   }
 
-  async postComment(_bodyMarkdown: string): Promise<void> {
-    throw new Error(READ_ONLY);
+  /** Submits a write to this pull request, once Bitbucket confirms it exists. */
+  async #submit<K extends keyof BitbucketActions>(kind: K, payload: BitbucketActions[K]): Promise<void> {
+    await this.#wire();
+    await this.ctx.host.submit(this.ctx.queue, kind, payload);
   }
 
-  async postInlineComment(_path: string, _line: number, _bodyMarkdown: string,
-                          _options?: { side?: "old" | "new" }): Promise<void> {
-    throw new Error(READ_ONLY);
+  async postComment(bodyMarkdown: string): Promise<void> {
+    await this.#submit("comment", { pullRequestId: this.id, body: text(bodyMarkdown, "bodyMarkdown", MAX_BODY_LENGTH) });
   }
 
-  async replyToComment(_commentId: string, _bodyMarkdown: string): Promise<void> {
-    throw new Error(READ_ONLY);
+  async postInlineComment(path: string, line: number, bodyMarkdown: string,
+                          options?: { side?: "old" | "new" }): Promise<void> {
+    const file = text(path, "path", 1024);
+    if (!Number.isInteger(line) || line < 1) throw new Error("line must be a positive line number.");
+    const side = options?.side ?? "new";
+    if (side !== "old" && side !== "new") throw new Error(`side must be "old" or "new".`);
+    await this.#submit("comment", {
+      pullRequestId: this.id, body: text(bodyMarkdown, "bodyMarkdown", MAX_BODY_LENGTH), inline: { path: file, line, side },
+    });
   }
 
-  async setTitle(_title: string): Promise<void> {
-    throw new Error(READ_ONLY);
+  async replyToComment(commentId: string, bodyMarkdown: string): Promise<void> {
+    if (typeof commentId !== "string" || !/^\d+$/.test(commentId)) throw new Error(`"${commentId}" is not a comment id.`);
+    await this.#submit("comment", {
+      pullRequestId: this.id, body: text(bodyMarkdown, "bodyMarkdown", MAX_BODY_LENGTH), parentId: Number(commentId),
+    });
   }
 
-  async setDescription(_bodyMarkdown: string): Promise<void> {
-    throw new Error(READ_ONLY);
+  async setTitle(title: string): Promise<void> {
+    await this.#submit("editPullRequest", { pullRequestId: this.id, title: text(title, "title", MAX_TITLE_LENGTH) });
+  }
+
+  async setDescription(bodyMarkdown: string): Promise<void> {
+    if (typeof bodyMarkdown !== "string" || bodyMarkdown.length > MAX_BODY_LENGTH) {
+      throw new Error(`bodyMarkdown must be a string of at most ${MAX_BODY_LENGTH} characters.`);
+    }
+    await this.#submit("editPullRequest", { pullRequestId: this.id, description: bodyMarkdown });
   }
 
   async approve(): Promise<void> {
-    throw new Error(READ_ONLY);
+    await this.#submit("approve", { pullRequestId: this.id });
   }
 
   async requestChanges(): Promise<void> {
-    throw new Error(READ_ONLY);
+    await this.#submit("requestChanges", { pullRequestId: this.id });
   }
 
   async decline(): Promise<void> {
-    throw new Error(READ_ONLY);
+    await this.#submit("decline", { pullRequestId: this.id });
   }
 
-  async merge(_options?: BitbucketMergeOptions): Promise<void> {
-    throw new Error(READ_ONLY);
+  async merge(options?: BitbucketMergeOptions): Promise<void> {
+    if (options?.strategy !== undefined && !MERGE_STRATEGIES.includes(options.strategy)) {
+      throw new Error(`strategy must be one of ${MERGE_STRATEGIES.join(", ")}.`);
+    }
+    const message = options?.message === undefined ? undefined : text(options.message, "message", MAX_BODY_LENGTH);
+    await this.#submit("merge", {
+      pullRequestId: this.id,
+      ...(options?.strategy !== undefined ? { strategy: options.strategy } : {}),
+      ...(message !== undefined ? { message } : {}),
+      ...(options?.closeSourceBranch !== undefined ? { closeSourceBranch: options.closeSourceBranch === true } : {}),
+    });
   }
 
   [Symbol.dispose](): void {
