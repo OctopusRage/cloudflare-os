@@ -65,7 +65,7 @@ export class BitbucketGatekeeperImpl extends DurableObject<Env, BitbucketGatekee
     },
     read: async op => {
       const pinned = await this.#pinned();
-      return await this.#creds.run(creds => op(new BitbucketApi(creds.accessToken), basePath(pinned)), { replayable: true });
+      return await this.#creds.run(creds => op(new BitbucketApi(creds), basePath(pinned)), { replayable: true });
     },
     cached: (key, ttlMs, load) => this.#cache.cached(key, ttlMs, load),
   };
@@ -112,7 +112,7 @@ export class BitbucketGatekeeperImpl extends DurableObject<Env, BitbucketGatekee
     const pinned = await this.#pinned();
     const fullName = (await this.#currentRepository(pinned, { fresh: true })).full_name;
     return await this.#creds.run(creds => startGitPull(
-      body => new BitbucketApi(creds.accessToken).fetchGitUploadPack(fullName, body), oids, options));
+      body => new BitbucketApi(creds).fetchGitUploadPack(fullName, body), oids, options));
   }
 
   async applyAction(_actionId: number, _cache: RpcStub<GitCache>): Promise<void> {
@@ -181,7 +181,7 @@ export class BitbucketGatekeeperImpl extends DurableObject<Env, BitbucketGatekee
     }
     const { workspace, repoSlug } = this.ctx.props;
     const repo = await this.#creds.run(creds =>
-      new BitbucketApi(creds.accessToken).find<WireRepository>(`/repositories/${seg(workspace)}/${seg(repoSlug)}`),
+      new BitbucketApi(creds).find<WireRepository>(`/repositories/${seg(workspace)}/${seg(repoSlug)}`),
       { replayable: true });
     if (!repo) {
       throw new Error(`The Bitbucket repository ${workspace}/${repoSlug} does not exist, or this connection can't read it.`);
@@ -199,7 +199,7 @@ export class BitbucketGatekeeperImpl extends DurableObject<Env, BitbucketGatekee
       return this.#repository.value;
     }
     const repo = await this.#creds.run(creds =>
-      new BitbucketApi(creds.accessToken).find<WireRepository>(basePath(pinned)), { replayable: true });
+      new BitbucketApi(creds).find<WireRepository>(basePath(pinned)), { replayable: true });
     if (!repo || repo.uuid !== pinned.repoUuid) {
       throw new Error("The pinned Bitbucket repository was deleted, or this connection can no longer read it.");
     }

@@ -13,8 +13,11 @@ import { VENDOR_ID } from "./bitbucket-env";
 export const RECONNECT_MESSAGE =
   "The Bitbucket connection has expired or was revoked. Reconnect the Bitbucket account.";
 
-/** What a facet sees of the grant: the refresh token never crosses the account boundary. */
-export type PublicGrant = { accessToken: string; expiresAt?: number };
+/**
+ * What a facet sees of the grant: the refresh token never crosses the account boundary. `email`
+ * is set for a connection made with an Atlassian API token, whose `accessToken` is that token.
+ */
+export type PublicGrant = { accessToken: string; expiresAt?: number; email?: string };
 
 /** The connected Bitbucket user, as the account last read them. */
 export type Identity = {

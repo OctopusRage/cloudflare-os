@@ -58,7 +58,7 @@ export class BitbucketConfiguratorUI extends RpcTarget implements BitbucketConfi
   }
 
   #read<T>(op: (api: BitbucketApi) => Promise<T>): Promise<T> {
-    return this.#creds.run(creds => op(new BitbucketApi(creds.accessToken)), { replayable: true });
+    return this.#creds.run(creds => op(new BitbucketApi(creds)), { replayable: true });
   }
 
   async listRepositories(query: string): Promise<ConfiguratorOption[]> {

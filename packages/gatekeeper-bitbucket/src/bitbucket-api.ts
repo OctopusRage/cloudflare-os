@@ -1,5 +1,5 @@
 // A thin client for Bitbucket Cloud's REST API 2.0 and its git smart-HTTP endpoints, as one
-// OAuth access token. It knows paths, paging and errors; what the responses mean is
+// OAuth access token or one Atlassian API token. It knows paths, paging and errors; what the responses mean is
 // bitbucket-normalize.ts's business, and who may ask is the gatekeeper's.
 //
 // Bitbucket answers some reads (a pull request's diff and diffstat) with a 302 to another API
@@ -67,11 +67,27 @@ async function errorOf(response: Response, what: string): Promise<BitbucketApiEr
     `Bitbucket ${what} failed (HTTP ${response.status})${detail ? `: ${detail}` : "."}`);
 }
 
-export class BitbucketApi {
-  readonly #token: string;
+/**
+ * How a request authenticates: an OAuth access token alone, or an Atlassian API token with the
+ * email of the account it belongs to.
+ */
+export type BitbucketAuth = { accessToken: string; email?: string };
 
-  constructor(accessToken: string) {
-    this.#token = accessToken;
+export class BitbucketApi {
+  readonly #restAuth: string;
+  readonly #gitAuth: string;
+
+  constructor(auth: BitbucketAuth) {
+    if (auth.email !== undefined) {
+      // An Atlassian API token is Basic auth: the account email for REST, and a fixed username
+      // for git over HTTPS. It is refused as a bearer token.
+      this.#restAuth = `Basic ${btoa(`${auth.email}:${auth.accessToken}`)}`;
+      this.#gitAuth = `Basic ${btoa(`x-bitbucket-api-token-auth:${auth.accessToken}`)}`;
+    } else {
+      // An OAuth access token authenticates git over HTTPS as the `x-token-auth` user.
+      this.#restAuth = `Bearer ${auth.accessToken}`;
+      this.#gitAuth = `Basic ${btoa(`x-token-auth:${auth.accessToken}`)}`;
+    }
   }
 
   /** Sends one API request, following same-origin redirects. `path` is under `/2.0` or a full API URL. */
@@ -83,7 +99,7 @@ export class BitbucketApi {
       const response = await fetch(url.toString(), {
         method: init.method ?? "GET",
         headers: {
-          Authorization: `Bearer ${this.#token}`,
+          Authorization: this.#restAuth,
           Accept: init.accept ?? "application/json",
           "User-Agent": USER_AGENT,
           ...(init.body !== undefined ? { "Content-Type": "application/json" } : {}),
@@ -168,11 +184,9 @@ export class BitbucketApi {
   async #gitPost(fullName: string, service: string, body: Uint8Array | ReadableStream<Uint8Array>,
                  headers: Record<string, string>): Promise<Response> {
     const [workspace, repo] = fullName.split("/");
-    // An OAuth access token authenticates git over HTTPS as the `x-token-auth` user.
-    const auth = btoa(`x-token-auth:${this.#token}`);
     const response = await fetch(`${WEB_ORIGIN}/${seg(workspace)}/${seg(repo)}.git/${service}`, {
       method: "POST",
-      headers: { ...headers, Authorization: `Basic ${auth}`, "User-Agent": USER_AGENT },
+      headers: { ...headers, Authorization: this.#gitAuth, "User-Agent": USER_AGENT },
       body,
       redirect: "manual",
       signal: AbortSignal.timeout(GIT_TIMEOUT_MS),

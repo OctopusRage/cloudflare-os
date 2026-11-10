@@ -4,12 +4,19 @@
 // bitbucket-gatekeeper.ts and bitbucket-sessions.ts, re-exported here so wrangler finds every
 // class on the main module.
 //
-// A connection is a Bitbucket Cloud OAuth 2.0 consumer grant. Access tokens live two hours and
-// are refreshed through the kit's `CredentialCoordinator`; Bitbucket documents no revocation
-// endpoint, so a disconnect forgets the grant. The consumer's permissions are fixed when it is
-// created, so a grant is checked against the scopes the token response reports. A connection is
-// pinned to the Bitbucket user (`GET /user`'s UUID) it was made as, and a reconnect that comes
-// back as anyone else is refused.
+// A connection is made one of two ways, chosen on the connect page:
+//
+// - A Bitbucket Cloud OAuth 2.0 consumer grant. Access tokens live two hours and are refreshed
+//   through the kit's `CredentialCoordinator`. The consumer's permissions are fixed when it is
+//   created, so a grant is checked against the scopes the token response reports.
+// - An Atlassian API token the user pastes with their account email. It is stored in this
+//   connection's own `UserAccount`, never refreshed, and declared dead the first time Bitbucket
+//   refuses it, which asks the user to reconnect with a new one. It needs no OAuth consumer, so a
+//   deployment without CLIENT_ID / CLIENT_SECRET offers only this mode.
+//
+// Bitbucket documents no revocation endpoint, so a disconnect forgets the credential either way.
+// A connection is pinned to the Bitbucket user (`GET /user`'s UUID) it was made as, and a
+// reconnect that comes back as anyone else is refused, whichever mode it uses.
 
 import { DurableObject, RpcStub, WorkerEntrypoint } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
@@ -29,10 +36,13 @@ import type {
 import { workerVersionTag } from "@gadgets/workshop-shared/gatekeeper";
 import { KvTtlCache } from "@gadgets/gatekeeper-kit/cache";
 import {
-  connectHandoffPageHtml, errorPageHtml, htmlResponse, INVALID_LINK_HTML,
+  PAGE_STYLE, connectHandoffPageHtml, connectMutationError, errorPageHtml, escapeHtml, htmlResponse, INVALID_LINK_HTML,
 } from "@gadgets/gatekeeper-kit/connect-pages";
-import { NONCE_KEY, advanceToOAuth, claimOAuth, putInitiation } from "@gadgets/gatekeeper-kit/connect-handshake";
-import { CONNECT_TIMEOUT_MS, NONCE_BYTES, generateNonce } from "@gadgets/gatekeeper-kit/connect-nonce";
+import {
+  NONCE_KEY, advanceToOAuth, claimOAuth, putInitiation, type StoredNonce,
+} from "@gadgets/gatekeeper-kit/connect-handshake";
+import { CONNECT_TIMEOUT_MS, NONCE_BYTES, generateNonce, isLiveNonce } from "@gadgets/gatekeeper-kit/connect-nonce";
+import { readTextCapped } from "@gadgets/gatekeeper-kit/response-body";
 import {
   CredentialCoordinator,
   CredentialSource,
@@ -46,7 +56,7 @@ import { notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential
 import { commitStagedCredentials, discardStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import { OAuthClient, mergeOAuthTokens, oauthRefresh, type OAuthTokens } from "@gadgets/gatekeeper-kit/oauth-client";
 import { PreviewOAuth, PreviewOAuthConfigurationError } from "@gadgets/gatekeeper-kit/preview-oauth";
-import { BitbucketApi, isAuthError, isDenial, seg } from "./bitbucket-api";
+import { BitbucketApi, isAuthError, isDenial, seg, type BitbucketAuth } from "./bitbucket-api";
 import { BitbucketConfiguratorUI } from "./bitbucket-configurator";
 import {
   RECONNECT_MESSAGE,
@@ -106,9 +116,9 @@ const PROBE_CONCURRENCY = 6;
  * Whether Bitbucket opens a repository for the user whose token this is: a 403 or 404 is a
  * definite no, and any other failure leaves access undetermined, so it throws.
  */
-async function probe(accessToken: string, { workspaceUuid, repoUuid }: RepositoryKey): Promise<boolean> {
+async function probe(auth: BitbucketAuth, { workspaceUuid, repoUuid }: RepositoryKey): Promise<boolean> {
   try {
-    await new BitbucketApi(accessToken).get(`/repositories/${seg(workspaceUuid)}/${seg(repoUuid)}`, { fields: "uuid" });
+    await new BitbucketApi(auth).get(`/repositories/${seg(workspaceUuid)}/${seg(repoUuid)}`, { fields: "uuid" });
     return true;
   } catch (error) {
     if (isDenial(error)) return false;
@@ -116,8 +126,23 @@ async function probe(accessToken: string, { workspaceUuid, repoUuid }: Repositor
   }
 }
 
-/** The stored grant. The refresh token is never sent across the account boundary. */
-type Grant = { accessToken: string; refreshToken?: string; expiresAt?: number; scopes: string[] };
+/**
+ * The stored grant. The refresh token is never sent across the account boundary. A grant with
+ * `email` is an Atlassian API token (`accessToken` is the token): no refresh token, no expiry, and
+ * no scopes Bitbucket reports.
+ */
+type Grant = { accessToken: string; refreshToken?: string; expiresAt?: number; scopes: string[]; email?: string };
+
+/** What the user is told when a pasted API token stops working. */
+const API_TOKEN_EXPIRED_MESSAGE =
+  "Bitbucket refused the connection's API token; it may have expired or been revoked. " +
+  "Reconnect the Bitbucket account with a new API token.";
+
+/** Caps on what the API-token form accepts. */
+const MAX_CONNECT_FORM_BYTES = 16 * 1024;
+const MAX_EMAIL_LENGTH = 254;
+const MAX_TOKEN_LENGTH = 4096;
+const EMAIL = /^[^\s@]+@[^\s@]+$/;
 
 /** What a connect attempt carries from the authorize redirect to the callback. */
 type ConnectAttempt = {
@@ -136,8 +161,60 @@ type ReconnectStage = { grant: Grant; identity: Identity; startedUnder: string }
 type CallbackResult = { handoff: ConnectHandoff } | { refused: { title: string; detail: string } };
 
 const NOT_CONFIGURED_HTML = errorPageHtml(
-  "Bitbucket gatekeeper not configured",
-  "Configure a Bitbucket OAuth consumer key and secret for this gatekeeper.");
+  "Bitbucket sign-in is not configured",
+  "This gatekeeper has no Bitbucket OAuth consumer. Go back and connect with an API token instead.");
+
+/** The scopes an Atlassian API token needs for everything the gatekeeper does. */
+const API_TOKEN_SCOPES = [
+  "read:user:bitbucket", "read:workspace:bitbucket", "read:repository:bitbucket", "write:repository:bitbucket",
+  "read:pullrequest:bitbucket", "write:pullrequest:bitbucket",
+];
+
+/**
+ * The connect link's page: a Bitbucket sign-in button when an OAuth consumer is configured, and a
+ * form for an Atlassian API token, which posts back to the same link.
+ */
+function connectPageHtml(options: { oauth: boolean; error?: string; email?: string }): string {
+  const oauth = options.oauth
+    ? `<a class="btn" href="?via=oauth">Sign in with Bitbucket</a>
+<div class="or"><span>or use an API token</span></div>`
+    : "";
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="same-origin">
+<title>Connect Bitbucket</title><style>${PAGE_STYLE}
+  label { display: block; font-size: 13px; font-weight: 600; margin: 14px 0 4px; color: var(--strong); }
+  input { width: 100%; box-sizing: border-box; padding: 8px 10px; font: inherit; color: var(--text);
+          background: var(--control); border: 1px solid var(--line); border-radius: 6px; }
+  .btn, button { display: block; width: 100%; box-sizing: border-box; margin-top: 18px; padding: 9px 12px;
+                 font: inherit; font-weight: 600; text-align: center; text-decoration: none; cursor: pointer;
+                 color: var(--on-contrast); background: var(--contrast); border: 0; border-radius: 6px; }
+  .or { display: flex; align-items: center; gap: 10px; margin: 22px 0 4px; color: var(--subtle); font-size: 13px; }
+  .or::before, .or::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+  .hint { font-size: 13px; color: var(--subtle); margin: 4px 0 0; }
+  details { font-size: 13px; color: var(--subtle); margin-top: 14px; }
+  code { font-size: 12px; }
+</style></head>
+<body><main><h1>Connect Bitbucket</h1>
+<p class="sub">Let Cloudflare OS work on your Bitbucket Cloud repositories and pull requests.</p>
+${options.error ? `<p class="err">${escapeHtml(options.error)}</p>` : ""}
+${oauth}
+<form method="POST">
+  <label for="email">Atlassian account email</label>
+  <input id="email" name="email" type="email" required autocomplete="username"
+         value="${escapeHtml(options.email ?? "")}">
+  <label for="token">API token</label>
+  <input id="token" name="token" type="password" required autocomplete="off">
+  <p class="hint">Stored only in this connection. Bitbucket's actions run as you, with what the token allows.</p>
+  <details><summary>How to create an API token</summary>
+    <p>Bitbucket → Personal settings → Atlassian account settings → Security → <b>Create API token with
+    scopes</b>, app <b>Bitbucket</b>, with these scopes:</p>
+    <p>${API_TOKEN_SCOPES.map(scope => `<code>${scope}</code>`).join(", ")}</p>
+  </details>
+  <button type="submit">Connect with API token</button>
+</form></main></body></html>`;
+}
 
 /** The Bitbucket OAuth consumer, built from this Worker's secrets. */
 function oauthClient(env: Env): OAuthClient {
@@ -167,9 +244,9 @@ function toGrant(tokens: OAuthTokens): Grant {
   };
 }
 
-/** Reads the user a token belongs to. */
-async function fetchUser(accessToken: string): Promise<Identity> {
-  const user = await new BitbucketApi(accessToken).get<WireUser>("/user");
+/** Reads the user a credential belongs to. */
+async function fetchUser(auth: BitbucketAuth): Promise<Identity> {
+  const user = await new BitbucketApi(auth).get<WireUser>("/user");
   if (!user.uuid) throw new Error("Bitbucket did not say which user this connection belongs to.");
   return {
     userUuid: user.uuid,
@@ -218,10 +295,45 @@ export default {
     const path = relPath.slice(1).split("/");
 
     if (path.length === 2 && path[0].length === 64 && path[1].length === NONCE_BYTES * 2) {
-      if (!env.CLIENT_ID || !env.CLIENT_SECRET) return htmlResponse(NOT_CONFIGURED_HTML);
+      const oauthConfigured = Boolean(env.CLIENT_ID && env.CLIENT_SECRET);
+      const stub = accountFor(ctx, path[0]);
+      if (stub === null) return htmlResponse(INVALID_LINK_HTML);
+
+      if (req.method === "POST") {
+        const rejected = connectMutationError(req,
+          { origin: getBaseUrl(env), contentType: "application/x-www-form-urlencoded" });
+        if (rejected) return htmlResponse(errorPageHtml("Connection refused", "Start the connection again."), 403);
+        let form: URLSearchParams;
+        try {
+          form = new URLSearchParams(await readTextCapped(req, MAX_CONNECT_FORM_BYTES));
+        } catch {
+          return new Response("Invalid form submission.", { status: 400 });
+        }
+        const email = (form.get("email") ?? "").trim();
+        const token = (form.get("token") ?? "").trim();
+        const formError = !email || !token ? "Enter both your Atlassian account email and an API token."
+          : email.length > MAX_EMAIL_LENGTH || !EMAIL.test(email) ? "That isn't an email address."
+          : token.length > MAX_TOKEN_LENGTH ? "That API token is too long."
+          : undefined;
+        const page = (error: string, status: number) =>
+          htmlResponse(connectPageHtml({ oauth: oauthConfigured, error, email }), status);
+        if (formError) return page(formError, 400);
+        const result = await stub.acceptApiToken(path[1], email, token);
+        if (result === null) return htmlResponse(INVALID_LINK_HTML);
+        if ("formError" in result) return page(result.formError, 400);
+        if ("refused" in result) return htmlResponse(errorPageHtml(result.refused.title, result.refused.detail), 409);
+        return htmlResponse(connectHandoffPageHtml(result.handoff));
+      }
+
+      if (url.searchParams.get("via") !== "oauth") {
+        if (!await stub.isConnectLinkLive(path[1])) return htmlResponse(INVALID_LINK_HTML);
+        return htmlResponse(connectPageHtml({ oauth: oauthConfigured }));
+      }
+
+      if (!oauthConfigured) return htmlResponse(NOT_CONFIGURED_HTML);
       const previewOAuth = previewOAuthFor(env);
       if (previewOAuth instanceof Response) return previewOAuth;
-      const begun = await accountFor(ctx, path[0])?.beginOAuthFlow(path[1], previewOAuth.redirectUri);
+      const begun = await stub.beginOAuthFlow(path[1], previewOAuth.redirectUri);
       if (!begun) return htmlResponse(INVALID_LINK_HTML);
       // No `scope` and no PKCE: a Bitbucket consumer's permissions are fixed on the consumer, and
       // Bitbucket Cloud's authorization server does not take a code challenge.
@@ -311,7 +423,9 @@ export class UserAccount extends DurableObject<Env> {
     vendorId: VENDOR_ID,
   });
 
-  readonly #refresh = (grant: Grant): Promise<Grant> => {
+  readonly #refresh = async (grant: Grant): Promise<Grant> => {
+    // An API token has nothing to refresh with: once refused, it is dead.
+    if (grant.email !== undefined) throw new CredentialsExpiredError(API_TOKEN_EXPIRED_MESSAGE);
     logger.info("refreshing Bitbucket access token", { event: "bitbucket.token.refresh" });
     return oauthRefresh<Grant>(oauthClient(this.env), {
       refreshToken: current => current.refreshToken,
@@ -391,12 +505,61 @@ export class UserAccount extends DurableObject<Env> {
     }
     let identity: Identity;
     try {
-      identity = await fetchUser(grant.accessToken);
+      identity = await fetchUser(grant);
     } catch (error) {
       throw new Error("Could not read which Bitbucket user authorized this connection. Please try again.",
         { cause: error });
     }
+    return await this.#finishConnect(grant, identity, attempt);
+  }
 
+  /** Whether a connect link's initiation nonce is live, for showing the connect page. */
+  async isConnectLinkLive(initiationNonce: string): Promise<boolean> {
+    const stored = this.ctx.storage.kv.get<StoredNonce>(NONCE_KEY);
+    return stored?.stage === "initiation" && isLiveNonce(stored, initiationNonce, Date.now());
+  }
+
+  /**
+   * Connects with an Atlassian API token pasted on the connect page. The link is claimed before
+   * Bitbucket is asked, so a second submission can't connect twice; a token Bitbucket refuses
+   * gives the link back so the user can correct it.
+   * @returns The handoff, a refusal, an error to show on the form, or null for a dead link.
+   */
+  async acceptApiToken(initiationNonce: string, email: string, token: string):
+      Promise<CallbackResult | { formError: string } | null> {
+    const kv = this.ctx.storage.kv;
+    const initiation = kv.get<StoredNonce<ConnectAttempt>>(NONCE_KEY);
+    if (initiation?.stage !== "initiation") return null;
+    const claimNonce = advanceToOAuth<ConnectAttempt>(kv, initiationNonce, Date.now(), {
+      redirectUri: "",
+      startedUnder: this.#creds.connectionGeneration(),
+    });
+    if (claimNonce === null) return null;
+    const attempt = claimOAuth<ConnectAttempt>(kv, claimNonce, Date.now())!;
+
+    const grant: Grant = { accessToken: token, email, scopes: [] };
+    let identity: Identity;
+    try {
+      identity = await fetchUser(grant);
+    } catch (error) {
+      // Give the link back, unless another flow has taken its place meanwhile.
+      if (kv.get(NONCE_KEY) === undefined) kv.put(NONCE_KEY, initiation);
+      if (isAuthError(error)) {
+        return { formError: "Bitbucket refused that email and API token. Check both, and that the token " +
+          "has the read:user:bitbucket scope." };
+      }
+      if (isDenial(error)) {
+        return { formError: "That API token can't read your Bitbucket user. Give it the read:user:bitbucket scope." };
+      }
+      logger.warn("API token validation failed", { event: "bitbucket.api_token.validate.failed", error });
+      return { formError: "Could not reach Bitbucket to check the API token. Please try again." };
+    }
+    return await this.#finishConnect(grant, identity, attempt);
+  }
+
+  /** Makes a verified grant the connection's, or stages it for a reconnect. */
+  async #finishConnect(grant: Grant, identity: Identity, attempt: ConnectAttempt): Promise<CallbackResult> {
+    const kv = this.ctx.storage.kv;
     const callback = kv.get<Fetcher<GatekeeperConnectCallback>>("callback");
     if (callback === undefined) {
       throw new Error("The Bitbucket account was disconnected while it was being authorized. Connect it again.");
@@ -471,8 +634,16 @@ export class UserAccount extends DurableObject<Env> {
       if (isCredentialsExpired(error)) throw new CredentialsExpiredError(RECONNECT_MESSAGE, { cause: error });
       throw error;
     }
-    const { creds: { accessToken, expiresAt }, identity, generation } = snapshot;
-    return { creds: { accessToken, ...(expiresAt !== undefined ? { expiresAt } : {}) }, identity, generation };
+    const { creds: { accessToken, expiresAt, email }, identity, generation } = snapshot;
+    return {
+      creds: {
+        accessToken,
+        ...(expiresAt !== undefined ? { expiresAt } : {}),
+        ...(email !== undefined ? { email } : {}),
+      },
+      identity,
+      generation,
+    };
   }
 
   /** Adjudicates Bitbucket's refusal of the credential with `identity`. */
@@ -489,7 +660,7 @@ export class UserAccount extends DurableObject<Env> {
     if (stored === undefined || !this.#creds.stored()) throw new CredentialsExpiredError(RECONNECT_MESSAGE);
     if (Date.now() - stored.fetchedAt < IDENTITY_TTL_MS) return stored;
     try {
-      const fresh = await this.#source.run(creds => fetchUser(creds.accessToken), { replayable: true });
+      const fresh = await this.#source.run(creds => fetchUser(creds), { replayable: true });
       if (fresh.userUuid !== stored.userUuid) throw new Error("Bitbucket described a different user than the grant's.");
       this.ctx.storage.kv.put<Identity>("identity", fresh);
       return fresh;
@@ -515,7 +686,7 @@ export class UserAccount extends DurableObject<Env> {
     for (let start = 0; start < ids.length; start += PROBE_CONCURRENCY) {
       await Promise.all(ids.slice(start, start + PROBE_CONCURRENCY).map(async id => {
         allowed.set(id, await this.#access.cached(id, accessTtl, () =>
-          this.#source.run(creds => probe(creds.accessToken, parseSubresource(id)), { replayable: true })));
+          this.#source.run(creds => probe(creds, parseSubresource(id)), { replayable: true })));
       }));
     }
     return parsed.map(key => allowed.get(subresourceId(key))!);
