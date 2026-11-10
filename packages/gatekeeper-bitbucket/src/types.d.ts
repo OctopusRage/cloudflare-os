@@ -294,8 +294,11 @@ export type BitbucketParticipant = {
 export type BitbucketPullRequestDetails = BitbucketPullRequestSummary & {
   /** The description, as Bitbucket Markdown. */
   descriptionMarkdown: string;
-  /** Commit id at the head of the source branch. */
-  sourceCommit: string;
+  /**
+   * Commit id at the head of the source branch. Absent when Bitbucket no longer has that commit,
+   * e.g. the source branch was deleted while the pull request stayed open.
+   */
+  sourceCommit?: string;
   /** Commit id at the head of the destination branch, when Bitbucket reports it. */
   destinationCommit?: string;
   participants: BitbucketParticipant[];

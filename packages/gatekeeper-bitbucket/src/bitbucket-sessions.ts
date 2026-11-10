@@ -321,10 +321,10 @@ export class BitbucketPullRequestImpl extends RpcTarget implements BitbucketPull
     const full = async (hash: string | undefined) => hash === undefined ? undefined
       : (await this.ctx.host.read((api, base) => commitAt(api, base, hash)))?.hash;
     const [source, destination] = await Promise.all([full(pr.source.commit?.hash), full(pr.destination.commit?.hash)]);
-    if (!source) throw new Error(`Pull request #${this.id}'s source commit could not be read.`);
     await this.ctx.authorize({ title: `Read pull request #${this.id} in ${repo.full_name}`, description: `Read "${pr.title}".` });
-    await this.ctx.git.advertise([source, ...(destination ? [destination] : [])]);
-    return toPullRequestDetails(repo.full_name, pr, { source, ...(destination ? { destination } : {}) });
+    await this.ctx.git.advertise([...(source ? [source] : []), ...(destination ? [destination] : [])]);
+    return toPullRequestDetails(repo.full_name, pr,
+      { ...(source ? { source } : {}), ...(destination ? { destination } : {}) });
   }
 
   async readDiff(options?: BitbucketPageOptions): Promise<Cursor<BitbucketDiffFile>> {

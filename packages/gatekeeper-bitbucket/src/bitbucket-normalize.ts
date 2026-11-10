@@ -162,11 +162,11 @@ function participantState(state: string | null | undefined, approved: boolean | 
  * prefix, so the caller passes them resolved to full commit ids.
  */
 export function toPullRequestDetails(fullName: string, pr: WirePullRequest,
-                                     commits: { source: string; destination?: string }): BitbucketPullRequestDetails {
+                                     commits: { source?: string; destination?: string }): BitbucketPullRequestDetails {
   return {
     ...toPullRequestSummary(fullName, pr),
     descriptionMarkdown: pr.description ?? "",
-    sourceCommit: commits.source,
+    ...(commits.source ? { sourceCommit: commits.source } : {}),
     ...(commits.destination ? { destinationCommit: commits.destination } : {}),
     participants: (pr.participants ?? []).map(p => ({
       user: toActor(p.user), role: p.role, state: participantState(p.state, p.approved),
